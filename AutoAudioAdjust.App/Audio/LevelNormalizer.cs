@@ -2,54 +2,73 @@ using AutoAudioAdjust.App.Models;
 
 namespace AutoAudioAdjust.App.Audio;
 
+/// <summary>
+/// Keeps the heard level of one app near the target. The input is the true RMS of the
+/// app's audio for each tick, measured after the app volume (see <see cref="ProcessLoopbackMeter"/>).
+/// The windows store the source level (heard level divided by the volume that was applied), so
+/// changing the volume does not leave stale loud values in the history and cause overshoot.
+/// The heard level at the current volume is then predicted from that source level.
+/// </summary>
 public sealed class LevelNormalizer
 {
-    private const double SilenceGateDb = -52;
+    /// <summary>Lowest level the app shows or measures; values at or below it mean "no sound".</summary>
+    public const double FloorDb = -90;
+
+    // Silence is judged on the song itself (before the app volume), so a very low target or a
+    // low app volume never makes quiet music look like silence.
+    private const double SourceSilenceGateDb = -60;
     private const double DeadBandDb = 1.25;
     private const double RaiseRateDbPerSecond = 2.0;
     private const int WindowSize = 20;
     private const int FastWindowSize = 2;
     private const int MinimumSamples = 8;
 
-    private readonly Queue<double> _squaredPeaks = new();
-    private readonly Queue<double> _fastSquaredPeaks = new();
+    private readonly Queue<double> _squaredLevels = new();
+    private readonly Queue<double> _fastSquaredLevels = new();
     private int _silentTicks;
+    private float? _previousVolume;
 
-    public NormalizationResult Process(float peak, float currentVolume, AppSettings settings, double elapsedSeconds)
+    public NormalizationResult Process(double rms, float currentVolume, AppSettings settings, double elapsedSeconds)
     {
-        var peakDb = LinearToDb(peak);
-        if (peakDb <= SilenceGateDb)
+        // The audio measured in this tick was played at the volume set on the previous tick.
+        var playedVolume = _previousVolume ?? currentVolume;
+        _previousVolume = currentVolume;
+
+        var tickDb = LinearToDb(rms);
+        var sourceDb = playedVolume < 0.001f ? FloorDb : LinearToDb(rms / playedVolume);
+        if (sourceDb <= SourceSilenceGateDb)
         {
             _silentTicks++;
             if (_silentTicks >= 10)
             {
-                _squaredPeaks.Clear();
-                _fastSquaredPeaks.Clear();
+                _squaredLevels.Clear();
+                _fastSquaredLevels.Clear();
             }
 
-            return new NormalizationResult(null, peakDb, "소리를 기다리는 중", "무음 구간에서는 볼륨을 변경하지 않습니다.");
+            return new NormalizationResult(null, tickDb, "소리를 기다리는 중", "무음 구간에서는 볼륨을 변경하지 않습니다.");
         }
 
         _silentTicks = 0;
-        _squaredPeaks.Enqueue(peak * peak);
-        _fastSquaredPeaks.Enqueue(peak * peak);
-        while (_squaredPeaks.Count > WindowSize)
+        var source = rms / playedVolume;
+        _squaredLevels.Enqueue(source * source);
+        _fastSquaredLevels.Enqueue(source * source);
+        while (_squaredLevels.Count > WindowSize)
         {
-            _squaredPeaks.Dequeue();
+            _squaredLevels.Dequeue();
         }
-        while (_fastSquaredPeaks.Count > FastWindowSize)
+        while (_fastSquaredLevels.Count > FastWindowSize)
         {
-            _fastSquaredPeaks.Dequeue();
+            _fastSquaredLevels.Dequeue();
         }
 
-        var rmsOfPeaks = Math.Sqrt(_squaredPeaks.Average());
-        var measuredDb = LinearToDb(rmsOfPeaks);
-        var fastRmsOfPeaks = Math.Sqrt(_fastSquaredPeaks.Average());
-        var fastMeasuredDb = LinearToDb(fastRmsOfPeaks);
+        // Predicted heard level at the current volume.
+        var volumeDb = 20 * Math.Log10(Math.Max(0.001, currentVolume));
+        var measuredDb = SquaredToDb(_squaredLevels.Average()) + volumeDb;
+        var fastMeasuredDb = SquaredToDb(_fastSquaredLevels.Average()) + volumeDb;
         var fastErrorDb = settings.TargetLevelDb - fastMeasuredDb;
-        var canUseFastProtection = _fastSquaredPeaks.Count >= FastWindowSize && fastErrorDb < -DeadBandDb;
+        var canUseFastProtection = _fastSquaredLevels.Count >= FastWindowSize && fastErrorDb < -DeadBandDb;
 
-        if (_squaredPeaks.Count < MinimumSamples && !canUseFastProtection)
+        if (_squaredLevels.Count < MinimumSamples && !canUseFastProtection)
         {
             return new NormalizationResult(null, measuredDb, "소리를 분석하고 있습니다", "안정적인 기준을 잡기 위해 잠시 듣고 있습니다.");
         }
@@ -92,12 +111,20 @@ public sealed class LevelNormalizer
 
     public void Reset()
     {
-        _squaredPeaks.Clear();
-        _fastSquaredPeaks.Clear();
+        _squaredLevels.Clear();
+        _fastSquaredLevels.Clear();
         _silentTicks = 0;
+        _previousVolume = null;
     }
 
-    public static double LinearToDb(double linear) => linear <= 0.000001 ? -60 : Math.Max(-60, 20 * Math.Log10(linear));
+    // Source levels can exceed full scale when the volume is low, so no floor/clamp here.
+    private static double SquaredToDb(double squared) => 10 * Math.Log10(Math.Max(1e-12, squared));
+
+    public static double LinearToDb(double linear) =>
+        linear <= 1e-9 ? FloorDb : Math.Max(FloorDb, 20 * Math.Log10(linear));
+
+    /// <summary>True when a displayed level means "no sound".</summary>
+    public static bool IsSilent(double db) => db <= FloorDb + 0.1;
 }
 
 public sealed record NormalizationResult(

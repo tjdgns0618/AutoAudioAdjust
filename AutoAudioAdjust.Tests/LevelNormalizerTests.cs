@@ -23,7 +23,7 @@ public sealed class LevelNormalizerTests
         var normalizer = new LevelNormalizer();
         var settings = new AppSettings { TargetLevelDb = -18 };
 
-        var result = ProcessRepeatedly(normalizer, settings, peak: 0.5f, volume: 0.5f);
+        var result = ProcessRepeatedly(normalizer, settings, rms: 0.5f, volume: 0.5f);
 
         Assert.NotNull(result.NewVolume);
         Assert.True(result.NewVolume < 0.5f);
@@ -67,7 +67,7 @@ public sealed class LevelNormalizerTests
         var normalizer = new LevelNormalizer();
         var settings = new AppSettings { TargetLevelDb = -12 };
 
-        var result = ProcessRepeatedly(normalizer, settings, peak: 0.08f, volume: 0.4f);
+        var result = ProcessRepeatedly(normalizer, settings, rms: 0.08f, volume: 0.4f);
 
         Assert.NotNull(result.NewVolume);
         Assert.True(result.NewVolume > 0.4f);
@@ -78,9 +78,9 @@ public sealed class LevelNormalizerTests
     {
         var normalizer = new LevelNormalizer();
         var settings = new AppSettings { TargetLevelDb = -18 };
-        var matchingPeak = (float)Math.Pow(10, -18 / 20.0);
+        var matchingRms = (float)Math.Pow(10, -18 / 20.0);
 
-        var result = ProcessRepeatedly(normalizer, settings, matchingPeak, 0.5f);
+        var result = ProcessRepeatedly(normalizer, settings, matchingRms, 0.5f);
 
         Assert.Null(result.NewVolume);
         Assert.Contains("유지", result.StatusText);
@@ -97,7 +97,7 @@ public sealed class LevelNormalizerTests
             MaximumVolumePercent = 80
         };
 
-        var result = ProcessRepeatedly(normalizer, settings, peak: 0.9f, volume: 0.2f);
+        var result = ProcessRepeatedly(normalizer, settings, rms: 0.9f, volume: 0.2f);
 
         Assert.Null(result.NewVolume);
         Assert.Contains("안전 범위", result.DetailText);
@@ -115,7 +115,7 @@ public sealed class LevelNormalizerTests
 
         settings.Validate();
 
-        Assert.Equal(-8, settings.TargetLevelDb);
+        Assert.Equal(-18, settings.TargetLevelDb);
         Assert.True(settings.MaximumVolumePercent >= settings.MinimumVolumePercent + 5);
         Assert.InRange(settings.MaximumVolumePercent, 20, 100);
     }
@@ -123,15 +123,122 @@ public sealed class LevelNormalizerTests
     private static NormalizationResult ProcessRepeatedly(
         LevelNormalizer normalizer,
         AppSettings settings,
-        float peak,
+        double rms,
         float volume)
     {
         NormalizationResult? result = null;
         for (var i = 0; i < 8; i++)
         {
-            result = normalizer.Process(peak, volume, settings, 0.1);
+            result = normalizer.Process(rms, volume, settings, 0.1);
         }
 
         return result!;
+    }
+
+    [Fact]
+    public void OldPeakScaleTargetIsMovedOntoTrueRmsScale()
+    {
+        var settings = new AppSettings { TargetLevelDb = -18, LevelScaleVersion = 1 };
+
+        settings.MigrateLevelScale();
+        settings.MigrateLevelScale();
+
+        Assert.Equal(-28, settings.TargetLevelDb);
+        Assert.Equal(AppSettings.CurrentLevelScaleVersion, settings.LevelScaleVersion);
+    }
+
+    [Fact]
+    public void NewSettingsAreAlreadyOnTrueRmsScale()
+    {
+        var settings = new AppSettings();
+
+        settings.MigrateLevelScale();
+
+        Assert.Equal(-28, settings.TargetLevelDb);
+    }
+
+    [Fact]
+    public void LoweringDoesNotOvershootWhenMeasurementFollowsVolume()
+    {
+        // Simulates the real app: the heard level is source x volume and lags one tick.
+        var normalizer = new LevelNormalizer();
+        var settings = new AppSettings { TargetLevelDb = -40, MinimumVolumePercent = 1, MaximumVolumePercent = 100 };
+        const double sourceRms = 0.065; // about -23.7 dB, as measured on YouTube Music
+        var idealVolume = Math.Pow(10, -40 / 20.0) / sourceRms; // about 0.154
+        var volume = 0.5f;
+        var playedVolume = volume;
+        var lowestVolume = volume;
+
+        for (var tick = 0; tick < 100; tick++)
+        {
+            var result = normalizer.Process(sourceRms * playedVolume, volume, settings, 0.1);
+            playedVolume = volume;
+            if (result.NewVolume is { } newVolume)
+            {
+                volume = newVolume;
+            }
+            lowestVolume = Math.Min(lowestVolume, volume);
+        }
+
+        var overshootDb = 20 * Math.Log10(idealVolume / lowestVolume);
+        var finalErrorDb = 20 * Math.Log10(volume / idealVolume);
+        Assert.True(overshootDb < 2.5, $"overshoot {overshootDb:0.0} dB");
+        Assert.InRange(finalErrorDb, -1.5, 1.5);
+    }
+
+    [Fact]
+    public void QuietHeardLevelIsNotMistakenForSilenceWithLowTarget()
+    {
+        // Music at -23.7 dB played at 2% is heard at about -57.7 dB. With a -50 dB target the
+        // app must keep adjusting instead of treating it as silence.
+        var normalizer = new LevelNormalizer();
+        var settings = new AppSettings { TargetLevelDb = -50, MinimumVolumePercent = 1, MaximumVolumePercent = 100 };
+        const double sourceRms = 0.065;
+        var volume = 0.02f;
+        var playedVolume = volume;
+        NormalizationResult? result = null;
+
+        for (var tick = 0; tick < 40; tick++)
+        {
+            result = normalizer.Process(sourceRms * playedVolume, volume, settings, 0.1);
+            playedVolume = volume;
+            if (result.NewVolume is { } newVolume)
+            {
+                volume = newVolume;
+            }
+        }
+
+        Assert.DoesNotContain("기다리는", result!.StatusText);
+        Assert.True(volume > 0.02f, $"volume stayed at {volume}");
+    }
+
+    [Fact]
+    public void TargetCanGoDownToMinus75()
+    {
+        var settings = new AppSettings { TargetLevelDb = -90 };
+
+        settings.Validate();
+
+        Assert.Equal(-75, settings.TargetLevelDb);
+    }
+
+    [Theory]
+    [InlineData(-75, 0)]
+    [InlineData(-18, 100)]
+    [InlineData(-46.5, 50)]
+    [InlineData(-90, 0)]
+    [InlineData(-5, 100)]
+    public void LoudnessScaleMapsTargetRange(double db, double expectedScale)
+    {
+        Assert.Equal(expectedScale, Loudness.ToScale(db), 3);
+    }
+
+    [Fact]
+    public void LoudnessScaleRoundTrips()
+    {
+        for (var scale = 0; scale <= 100; scale += 10)
+        {
+            Assert.Equal(scale, Loudness.ToScale(Loudness.ToDb(scale)), 6);
+        }
     }
 }

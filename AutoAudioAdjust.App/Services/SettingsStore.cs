@@ -18,7 +18,17 @@ public sealed class SettingsStore
         {
             if (File.Exists(SettingsPath))
             {
-                var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath)) ?? new AppSettings();
+                var json = File.ReadAllText(SettingsPath);
+                var settings = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+                using (var document = JsonDocument.Parse(json))
+                {
+                    if (!document.RootElement.TryGetProperty(nameof(AppSettings.LevelScaleVersion), out _))
+                    {
+                        settings.LevelScaleVersion = 1;
+                    }
+                }
+
+                settings.MigrateLevelScale();
                 settings.Validate();
                 return settings;
             }

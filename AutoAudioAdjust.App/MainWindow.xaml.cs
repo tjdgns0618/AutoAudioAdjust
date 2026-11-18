@@ -1,23 +1,52 @@
+﻿using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows;
-using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Threading;
 using AutoAudioAdjust.App.Audio;
 using AutoAudioAdjust.App.Models;
 using AutoAudioAdjust.App.Services;
+using Microsoft.Web.WebView2.Core;
 
 namespace AutoAudioAdjust.App;
 
 public partial class MainWindow : Window
 {
-    private readonly AudioSessionService _audioSessions = new();
+    private const string HomeUrl = "https://music.youtube.com/";
+
+    private static readonly string WebViewDataFolder = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "AutoAudioAdjust",
+        "WebView2");
+
     private readonly SettingsStore _settingsStore = new();
     private readonly DispatcherTimer _meterTimer;
+    private readonly DispatcherTimer _ytmTimer;
     private readonly LevelNormalizer _normalizer = new();
+    private readonly EmbeddedPlayerAudio _player = new();
+    private readonly Queue<double> _recentSquaredLevels = new();
+    private ProcessLoopbackMeter? _meter;
+    private int? _meterProcessId;
     private AppSettings _settings = new();
-    private AudioSessionItem? _selectedSession;
-    private bool _isRunning;
     private bool _isLoading = true;
+    private bool _syncingUi;
+    private bool _ytmBusy;
+    private bool _ytmMuted;
+
+    // YouTube Music's own volume as a linear gain (player volume / 100, 0 when muted). Auto adjust
+    // measures the app's sound as if this were 100%, so lowering YouTube Music makes it quieter
+    // instead of being compensated by a higher app volume.
+    private double _ytmGain = 1.0;
+    private double YtmGainDb => 20 * Math.Log10(Math.Max(1e-4, _ytmGain));
+    private YouTubeMusicBridge? _bridge;
+    private NowPlaying _nowPlaying = NowPlaying.Empty;
+    private TrayIcon? _tray;
+    private MediaControls? _mediaControls;
+    private MiniPlayerWindow? _miniPlayer;
+    private bool _exiting;
+    private double _lastDisplayDb = LevelNormalizer.FloorDb;
+    private float? _lastVolume;
 
     public MainWindow()
     {
@@ -29,169 +58,431 @@ public partial class MainWindow : Window
         };
         _meterTimer.Tick += MeterTimer_Tick;
 
+        _ytmTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(600)
+        };
+        _ytmTimer.Tick += YtmTimer_Tick;
+
+        SourceInitialized += (_, _) =>
+        {
+            UseDarkTitleBar();
+            InitializeMediaControls();
+        };
         Loaded += MainWindow_Loaded;
+        Closing += MainWindow_Closing;
         Closed += MainWindow_Closed;
     }
 
-    private void MainWindow_Loaded(object sender, RoutedEventArgs e)
+    private void UseDarkTitleBar()
     {
-        _settings = _settingsStore.Load();
-        TargetSlider.Value = _settings.TargetLevelDb;
-        MinVolumeSlider.Value = _settings.MinimumVolumePercent;
-        MaxVolumeSlider.Value = _settings.MaximumVolumePercent;
-        _isLoading = false;
-        UpdateSettingLabels();
-        RefreshSessions(_settings.PreferredProcessName);
-        _meterTimer.Start();
+        const int DwmwaUseImmersiveDarkMode = 20;
+        var enabled = 1;
+        var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        _ = DwmSetWindowAttribute(handle, DwmwaUseImmersiveDarkMode, ref enabled, sizeof(int));
     }
 
-    private void RefreshSessions(string? preferredProcessName = null)
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+    private bool IsAutoAdjustOn => AutoToggle.IsChecked == true;
+
+    private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
-        StopNormalization("오디오 세션 목록을 갱신했습니다.");
-        var sessions = _audioSessions.Refresh();
-        SessionComboBox.ItemsSource = sessions;
+        _settings = _settingsStore.Load();
+        TargetSlider.Value = Math.Round(Loudness.ToScale(_settings.TargetLevelDb));
+        MinVolumeSlider.Value = _settings.MinimumVolumePercent;
+        MaxVolumeSlider.Value = _settings.MaximumVolumePercent;
+        AutoToggle.IsChecked = _settings.AutoAdjustEnabled;
+        _isLoading = false;
+        UpdateSettingLabels();
+        UpdateAutoState();
 
-        AudioSessionItem? preferred = null;
-        if (!string.IsNullOrWhiteSpace(preferredProcessName))
+        InitializeTray();
+
+        // Measurement starts once the player's audio session appears (see EnsureMeter).
+        _meterTimer.Start();
+
+        await InitializeBrowserAsync();
+    }
+
+    private async Task InitializeBrowserAsync()
+    {
+        try
         {
-            preferred = sessions.FirstOrDefault(x =>
-                string.Equals(x.ProcessName, preferredProcessName, StringComparison.OrdinalIgnoreCase));
+            Directory.CreateDirectory(WebViewDataFolder);
+            // WebView2 would register with the Windows media controls itself as "msedgewebview2.exe"
+            // (shown as an unknown app); the app registers under its own name instead (MediaControls).
+            var options = new CoreWebView2EnvironmentOptions("--disable-features=HardwareMediaKeyHandling");
+            var environment = await CoreWebView2Environment.CreateAsync(null, WebViewDataFolder, options);
+            await Browser.EnsureCoreWebView2Async(environment);
+
+            var core = Browser.CoreWebView2;
+            core.Settings.IsStatusBarEnabled = false;
+            core.NewWindowRequested += Browser_NewWindowRequested;
+            core.HistoryChanged += (_, _) => UpdateNavigationButtons();
+            core.NavigationCompleted += (_, _) => UpdateNavigationButtons();
+            _bridge = new YouTubeMusicBridge(core);
+            core.Navigate(HomeUrl);
+            BrowserPlaceholder.Visibility = Visibility.Collapsed;
+            _ytmTimer.Start();
+        }
+        catch (Exception ex) when (ex is WebView2RuntimeNotFoundException or COMException or InvalidOperationException)
+        {
+            BrowserPlaceholderText.Text = "Microsoft Edge WebView2 런타임이 필요합니다.\nhttps://developer.microsoft.com/microsoft-edge/webview2 에서 설치해 주세요.";
+        }
+    }
+
+    private void Browser_NewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
+    {
+        // Keep YouTube / Google pages (e.g. sign-in) inside the app; open anything else in the
+        // default browser so the player keeps playing.
+        if (Uri.TryCreate(e.Uri, UriKind.Absolute, out var uri) && IsInAppHost(uri.Host))
+        {
+            e.Handled = true;
+            Browser.CoreWebView2.Navigate(e.Uri);
+            return;
         }
 
-        preferred ??= sessions.FirstOrDefault(x => x.IsLikelyYouTubeMusic);
-        SessionComboBox.SelectedItem = preferred;
-
-        if (sessions.Count == 0)
+        e.Handled = true;
+        try
         {
-            FooterStatusText.Text = "재생 중인 앱을 찾지 못했습니다";
-            FooterDetailText.Text = "유튜브 뮤직에서 노래를 재생한 뒤 새로고침해 주세요.";
+            Process.Start(new ProcessStartInfo(e.Uri) { UseShellExecute = true });
         }
+        catch (Exception)
+        {
+            // Nothing to open with; ignore.
+        }
+    }
+
+    private static bool IsInAppHost(string host) =>
+        host.EndsWith("youtube.com", StringComparison.OrdinalIgnoreCase)
+        || host.EndsWith("google.com", StringComparison.OrdinalIgnoreCase)
+        || host.EndsWith("youtu.be", StringComparison.OrdinalIgnoreCase);
+
+    private void UpdateNavigationButtons()
+    {
+        if (Browser.CoreWebView2 is null)
+        {
+            return;
+        }
+
+        BackButton.IsEnabled = Browser.CoreWebView2.CanGoBack;
+        ForwardButton.IsEnabled = Browser.CoreWebView2.CanGoForward;
+    }
+
+    private void BackButton_Click(object sender, RoutedEventArgs e) => Browser.CoreWebView2?.GoBack();
+
+    private void ForwardButton_Click(object sender, RoutedEventArgs e) => Browser.CoreWebView2?.GoForward();
+
+    private void ReloadButton_Click(object sender, RoutedEventArgs e) => Browser.CoreWebView2?.Reload();
+
+    private void HomeButton_Click(object sender, RoutedEventArgs e) => Browser.CoreWebView2?.Navigate(HomeUrl);
+
+    /// <summary>
+    /// Captures the process that owns the player's audio session. WebView2 may restart its audio
+    /// process, so capture follows the session's process.
+    /// </summary>
+    private void EnsureMeter()
+    {
+        var pid = _player.SessionProcessId;
+        if (pid == _meterProcessId)
+        {
+            return;
+        }
+
+        _meter?.Dispose();
+        _meter = pid is { } id ? ProcessLoopbackMeter.Start(id) : null;
+        _meterProcessId = pid;
+        _normalizer.Reset();
+        _recentSquaredLevels.Clear();
     }
 
     private void MeterTimer_Tick(object? sender, EventArgs e)
     {
-        if (_selectedSession is null)
+        EnsureMeter();
+        if (_meter?.Error is { } error)
         {
-            UpdateMeter(-60, 0);
+            UpdateMeter(LevelNormalizer.FloorDb, null);
+            AutoStatusText.Text = "소리를 측정할 수 없습니다";
+            AutoDetailText.Text = $"Windows 11 또는 Windows 10 (20348 이상)이 필요합니다 · {error}";
+            return;
+        }
+
+        var level = _meter?.ReadRms() ?? 0;
+        // Level before YouTube Music's own volume; 0 (= silence, no change) when it is muted or at 0.
+        var compensated = _ytmGain >= 0.01 ? level / _ytmGain : 0;
+        RememberLevel(compensated);
+        CalibrateButton.IsEnabled = level > 0.0001; // above about -80 dB
+
+        if (!_player.HasSession)
+        {
+            UpdateMeter(LevelNormalizer.FloorDb, null);
+            SetAppVolumeControlsAvailable(false);
+            if (IsAutoAdjustOn)
+            {
+                AutoStatusText.Text = "재생을 기다리는 중";
+                AutoDetailText.Text = "유튜브 뮤직에서 곡을 재생하면 자동으로 보정합니다.";
+            }
             return;
         }
 
         try
         {
-            var peak = _selectedSession.PeakValue;
-            var volume = _selectedSession.Volume;
-            var instantaneousDb = LevelNormalizer.LinearToDb(peak);
-
-            if (_isRunning)
+            var volume = _player.Volume;
+            if (IsAutoAdjustOn)
             {
-                var result = _normalizer.Process(peak, volume, _settings, _meterTimer.Interval.TotalSeconds);
+                var result = _normalizer.Process(compensated, volume, _settings, _meterTimer.Interval.TotalSeconds);
                 if (result.NewVolume is { } newVolume)
                 {
-                    _selectedSession.Volume = newVolume;
+                    _player.Volume = newVolume;
                     volume = newVolume;
                 }
 
-                UpdateMeter(result.DisplayLevelDb, volume);
-                FooterStatusText.Text = result.StatusText;
-                FooterDetailText.Text = result.DetailText;
+                // Show what is actually heard (YouTube Music volume included).
+                var heardDb = LevelNormalizer.IsSilent(result.DisplayLevelDb)
+                    ? LevelNormalizer.LinearToDb(level)
+                    : result.DisplayLevelDb + YtmGainDb;
+                UpdateMeter(heardDb, volume);
+                AutoStatusText.Text = result.StatusText;
+                AutoDetailText.Text = result.DetailText;
             }
             else
             {
-                UpdateMeter(instantaneousDb, volume);
+                UpdateMeter(LevelNormalizer.LinearToDb(level), volume);
             }
-
-            CalibrateButton.IsEnabled = peak > 0.002f;
         }
-        catch (Exception)
+        catch (COMException)
         {
-            StopNormalization("선택한 오디오 세션이 종료되었습니다.");
-            FooterDetailText.Text = "노래를 재생한 뒤 새로고침해 주세요.";
-            CalibrateButton.IsEnabled = false;
+            // The player's audio session went away (device change, renderer restart).
+            _player.Invalidate();
         }
     }
 
-    private void UpdateMeter(double db, float volume)
+    private void RememberLevel(double level)
     {
-        var clampedDb = Math.Clamp(db, -60, 0);
-        var availableWidth = Math.Max(0, LevelMeter.Parent is FrameworkElement parent ? parent.ActualWidth : 0);
-        LevelMeter.Width = availableWidth * ((clampedDb + 60) / 60.0);
-        CurrentLevelText.Text = db <= -59.9 ? "— dB" : $"{db:0.0} dB";
-        CurrentVolumeText.Text = $"{volume * 100:0}%";
+        _recentSquaredLevels.Enqueue(level * level);
+        while (_recentSquaredLevels.Count > 10)
+        {
+            _recentSquaredLevels.Dequeue();
+        }
     }
 
-    private void ToggleButton_Click(object sender, RoutedEventArgs e)
+    private void UpdateMeter(double db, float? volume)
     {
-        if (_isRunning)
+        _lastDisplayDb = db;
+        _lastVolume = volume;
+        // The bar and the big number use the same 0-100 "듣는 크기" scale as the target slider.
+        var silent = LevelNormalizer.IsSilent(db);
+        var scale = silent ? 0 : Loudness.ToScale(db);
+        var width = LevelTrack.ActualWidth;
+        LevelMeter.Width = width * scale / 100;
+        // Where the sound settles: the target lowered by YouTube Music's own volume.
+        TargetMarker.Margin = new Thickness(width * Loudness.ToScale(_settings.TargetLevelDb + YtmGainDb) / 100 - 1, 0, 0, 0);
+        CurrentLevelText.Text = silent ? "—" : $"{scale:0}";
+        CurrentDbText.Text = silent ? "— dB RMS" : $"{db:0.0} dB RMS";
+        CurrentVolumeText.Text = volume is { } v ? $"{v * 100:0}%" : "—%";
+        if (volume is { } current)
         {
-            StopNormalization("자동 보정을 멈췄습니다.");
+            SetAppVolumeControlsAvailable(true);
+            if (!AppVolumeSlider.IsMouseCaptureWithin)
+            {
+                SyncSlider(AppVolumeSlider, current * 100);
+            }
+            AppMuteButton.Content = _player.Muted ? MutedIcon : VolumeIcon;
+        }
+    }
+
+    // ---------- 볼륨 조절 카드 ----------
+
+    private static readonly string VolumeIcon = char.ConvertFromUtf32(0xE767); // Segoe Fluent "Volume"
+    private static readonly string MutedIcon = char.ConvertFromUtf32(0xE74F);  // Segoe Fluent "Mute"
+
+    private async void YtmTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_ytmBusy || _bridge is null)
+        {
             return;
         }
 
-        if (_selectedSession is null)
+        _ytmBusy = true;
+        try
+        {
+            _nowPlaying = await _bridge.GetStateAsync();
+        }
+        finally
+        {
+            _ytmBusy = false;
+        }
+
+        var np = _nowPlaying;
+        YtmVolumeSlider.IsEnabled = np.Volume is not null;
+        YtmMuteButton.IsEnabled = np.Volume is not null;
+        if (np.Volume is { } volume)
+        {
+            _ytmMuted = np.Muted;
+            if (!YtmVolumeSlider.IsMouseCaptureWithin)
+            {
+                _ytmGain = np.Muted ? 0 : volume / 100.0;
+            }
+            YtmMuteButton.Content = _ytmMuted ? MutedIcon : VolumeIcon;
+            if (!YtmVolumeSlider.IsMouseCaptureWithin)
+            {
+                YtmVolumeText.Text = _ytmMuted ? "음소거" : $"{volume:0}%";
+                SyncSlider(YtmVolumeSlider, volume);
+            }
+        }
+        else
+        {
+            YtmVolumeText.Text = "—%";
+            _ytmGain = 1.0;
+        }
+
+        _tray?.Update(np, IsAutoAdjustOn, _settings.CloseAction == CloseAction.Ask);
+        _mediaControls?.Update(np);
+        UpdateMiniPlayer();
+    }
+
+    private void InitializeMediaControls()
+    {
+        var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        _mediaControls = MediaControls.TryCreate(handle);
+        if (_mediaControls is null)
+        {
+            return;
+        }
+
+        _mediaControls.ButtonPressed += button => Dispatcher.BeginInvoke(() =>
+        {
+            switch (button)
+            {
+                case Windows.Media.SystemMediaTransportControlsButton.Play:
+                case Windows.Media.SystemMediaTransportControlsButton.Pause:
+                    // Only toggle when the requested state differs, so Play never pauses.
+                    var wantPlaying = button == Windows.Media.SystemMediaTransportControlsButton.Play;
+                    if (_nowPlaying.IsPlaying != wantPlaying)
+                    {
+                        _ = _bridge?.PlayPauseAsync();
+                    }
+                    break;
+                case Windows.Media.SystemMediaTransportControlsButton.Next:
+                    _ = _bridge?.NextAsync();
+                    break;
+                case Windows.Media.SystemMediaTransportControlsButton.Previous:
+                    _ = _bridge?.PreviousAsync();
+                    break;
+            }
+        });
+    }
+
+    private async void YtmVolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_syncingUi || _bridge is null)
+        {
+            return;
+        }
+
+        var volume = (int)Math.Round(e.NewValue);
+        YtmVolumeText.Text = $"{volume}%";
+        _ytmGain = _ytmMuted ? 0 : volume / 100.0; // apply at once, before the next page poll
+        await _bridge.SetVolumeAsync(volume);
+    }
+
+    private async void YtmMuteButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_bridge is null)
+        {
+            return;
+        }
+
+        _ytmMuted = !_ytmMuted;
+        _ytmGain = _ytmMuted ? 0 : YtmVolumeSlider.Value / 100.0;
+        YtmMuteButton.Content = _ytmMuted ? MutedIcon : VolumeIcon;
+        await _bridge.SetMutedAsync(_ytmMuted);
+    }
+
+    private void AppVolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        // While auto adjust is on, the slider only displays the value the normalizer sets.
+        if (_syncingUi || _isLoading || IsAutoAdjustOn || !_player.HasSession)
+        {
+            return;
+        }
+
+        _player.Volume = (float)(e.NewValue / 100.0);
+        CurrentVolumeText.Text = $"{e.NewValue:0}%";
+    }
+
+    private void AppMuteButton_Click(object sender, RoutedEventArgs e)
+    {
+        var muted = !_player.Muted;
+        _player.Muted = muted;
+        AppMuteButton.Content = muted ? MutedIcon : VolumeIcon;
+    }
+
+    private void SetAppVolumeControlsAvailable(bool hasSession)
+    {
+        AppMuteButton.IsEnabled = hasSession;
+        AppVolumeSlider.IsEnabled = hasSession && !IsAutoAdjustOn;
+    }
+
+    private void SyncSlider(System.Windows.Controls.Slider slider, double value)
+    {
+        if (Math.Abs(slider.Value - value) < 0.5)
+        {
+            return;
+        }
+
+        _syncingUi = true;
+        slider.Value = value;
+        _syncingUi = false;
+    }
+
+    private void AutoToggle_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_isLoading)
         {
             return;
         }
 
         _normalizer.Reset();
-        _isRunning = true;
-        SessionComboBox.IsEnabled = false;
-        ToggleButton.Content = "자동 보정 중지";
-        ToggleButton.Background = new SolidColorBrush(Color.FromRgb(235, 108, 108));
-        StatusDot.Fill = new SolidColorBrush(Color.FromRgb(53, 214, 177));
-        StatusPill.Background = new SolidColorBrush(Color.FromRgb(18, 55, 49));
-        HeaderStatusText.Text = "보정 중";
-        FooterStatusText.Text = "소리를 분석하고 있습니다";
-
+        _settings.AutoAdjustEnabled = IsAutoAdjustOn;
         SaveSettings();
+        UpdateAutoState();
     }
 
-    private void StopNormalization(string message)
+    private void UpdateAutoState()
     {
-        _isRunning = false;
-        _normalizer.Reset();
-        SessionComboBox.IsEnabled = true;
-        ToggleButton.Content = "자동 보정 시작";
-        ToggleButton.Background = (Brush)FindResource("Accent");
-        StatusDot.Fill = new SolidColorBrush(Color.FromRgb(113, 128, 150));
-        StatusPill.Background = new SolidColorBrush(Color.FromRgb(25, 40, 58));
-        HeaderStatusText.Text = "대기 중";
-        FooterStatusText.Text = message;
-    }
-
-    private void SessionComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        _selectedSession = SessionComboBox.SelectedItem as AudioSessionItem;
-        ToggleButton.IsEnabled = _selectedSession is not null;
-        CalibrateButton.IsEnabled = false;
-
-        if (_selectedSession is not null)
+        var on = IsAutoAdjustOn;
+        StatusDot.Fill = new SolidColorBrush(on ? Color.FromRgb(53, 214, 177) : Color.FromRgb(113, 128, 150));
+        StatusPill.Background = new SolidColorBrush(on ? Color.FromRgb(18, 55, 49) : Color.FromRgb(25, 40, 58));
+        HeaderStatusText.Text = on ? "보정 중" : "대기 중";
+        AppVolumeSlider.IsEnabled = !on && _player.HasSession;
+        AppVolumeHint.Text = on
+            ? "자동 보정이 켜져 있으면 앱 볼륨은 자동으로 조절됩니다. 유튜브 뮤직 볼륨은 목표 크기 위에 그대로 적용됩니다."
+            : "자동 보정이 꺼져 있어 앱 볼륨을 직접 조절할 수 있습니다.";
+        if (!on)
         {
-            FooterStatusText.Text = $"{_selectedSession.DisplayName} 준비 완료";
-            FooterDetailText.Text = "자동 보정을 시작하면 이 앱의 볼륨만 조절합니다.";
-            _settings.PreferredProcessName = _selectedSession.ProcessName;
-            SaveSettings();
+            AutoStatusText.Text = "자동 보정이 꺼져 있습니다";
+            AutoDetailText.Text = "켜면 곡이 바뀌어도 같은 크기로 맞춰 줍니다.";
         }
     }
-
-    private void RefreshButton_Click(object sender, RoutedEventArgs e) => RefreshSessions(_settings.PreferredProcessName);
 
     private void CalibrateButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_selectedSession is null)
+        // Average of the last second of true RMS, so one quiet or loud moment does not set the target.
+        var currentDb = _recentSquaredLevels.Count == 0
+            ? LevelNormalizer.FloorDb
+            : LevelNormalizer.LinearToDb(Math.Sqrt(_recentSquaredLevels.Average()));
+        if (currentDb <= -80)
         {
+            AutoStatusText.Text = "소리가 충분히 감지되지 않았습니다";
             return;
         }
 
-        var currentDb = LevelNormalizer.LinearToDb(_selectedSession.PeakValue);
-        if (currentDb <= -50)
-        {
-            FooterStatusText.Text = "소리가 충분히 감지되지 않았습니다";
-            return;
-        }
-
-        TargetSlider.Value = Math.Clamp(Math.Round(currentDb), TargetSlider.Minimum, TargetSlider.Maximum);
-        FooterStatusText.Text = "현재 음량을 목표로 설정했습니다";
-        FooterDetailText.Text = "곡의 큰 부분에서 기준을 잡으면 더 자연스럽게 동작합니다.";
+        TargetSlider.Value = Math.Round(Loudness.ToScale(currentDb));
+        AutoStatusText.Text = "현재 음량을 목표로 설정했습니다";
+        AutoDetailText.Text = "곡의 큰 부분에서 기준을 잡으면 더 자연스럽게 동작합니다.";
     }
 
     private void SettingsSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -210,7 +501,7 @@ public partial class MainWindow : Window
             MinVolumeSlider.Value = Math.Max(0, MaxVolumeSlider.Value - 5);
         }
 
-        _settings.TargetLevelDb = TargetSlider.Value;
+        _settings.TargetLevelDb = Loudness.ToDb(TargetSlider.Value);
         _settings.MinimumVolumePercent = (int)Math.Round(MinVolumeSlider.Value);
         _settings.MaximumVolumePercent = (int)Math.Round(MaxVolumeSlider.Value);
         UpdateSettingLabels();
@@ -219,7 +510,8 @@ public partial class MainWindow : Window
 
     private void UpdateSettingLabels()
     {
-        TargetLevelText.Text = $"{TargetSlider.Value:0} dB";
+        TargetLevelText.Text = $"{TargetSlider.Value:0}";
+        TargetDbText.Text = $"{Loudness.ToDb(TargetSlider.Value):0.#} dB";
         MinVolumeText.Text = $"{MinVolumeSlider.Value:0}%";
         MaxVolumeText.Text = $"{MaxVolumeSlider.Value:0}%";
     }
@@ -232,10 +524,135 @@ public partial class MainWindow : Window
         }
     }
 
+    // ---------- 트레이 / 미니 플레이어 / 닫기 ----------
+
+    private void InitializeTray()
+    {
+        var iconStream = Application.GetResourceStream(new Uri("pack://application:,,,/Assets/AppIcon.ico")).Stream;
+        var size = System.Windows.Forms.SystemInformation.SmallIconSize;
+        _tray = new TrayIcon(new System.Drawing.Icon(iconStream, size));
+        _tray.OpenRequested += ShowFromTray;
+        _tray.ExitRequested += ExitApp;
+        _tray.PlayPauseRequested += () => _ = _bridge?.PlayPauseAsync();
+        _tray.NextRequested += () => _ = _bridge?.NextAsync();
+        _tray.PreviousRequested += () => _ = _bridge?.PreviousAsync();
+        _tray.AutoAdjustToggled += () => AutoToggle.IsChecked = !IsAutoAdjustOn;
+        _tray.AskOnCloseToggled += () =>
+        {
+            // Turning "ask" off keeps the X button sending the app to the tray.
+            _settings.CloseAction = _settings.CloseAction == CloseAction.Ask ? CloseAction.Tray : CloseAction.Ask;
+            SaveSettings();
+            _tray.Update(_nowPlaying, IsAutoAdjustOn, _settings.CloseAction == CloseAction.Ask);
+        };
+        _tray.MiniPlayerRequested += _ => ToggleMiniPlayer();
+        _tray.Update(_nowPlaying, IsAutoAdjustOn, _settings.CloseAction == CloseAction.Ask);
+
+        _miniPlayer = new MiniPlayerWindow();
+        _miniPlayer.OpenRequested += ShowFromTray;
+        _miniPlayer.PlayPauseRequested += () => _ = _bridge?.PlayPauseAsync();
+        _miniPlayer.NextRequested += () => _ = _bridge?.NextAsync();
+        _miniPlayer.PreviousRequested += () => _ = _bridge?.PreviousAsync();
+        _miniPlayer.AutoAdjustChanged += on => AutoToggle.IsChecked = on;
+    }
+
+    private void ToggleMiniPlayer()
+    {
+        if (_miniPlayer is null)
+        {
+            return;
+        }
+
+        if (_miniPlayer.IsVisible)
+        {
+            _miniPlayer.Hide();
+            return;
+        }
+
+        UpdateMiniPlayer(force: true);
+        _miniPlayer.ShowNearTray();
+    }
+
+    private void UpdateMiniPlayer(bool force = false)
+    {
+        if (_miniPlayer is { } mini && (force || mini.IsVisible))
+        {
+            mini.Update(_nowPlaying, _lastDisplayDb, _lastVolume, IsAutoAdjustOn);
+        }
+    }
+
+    private void ShowFromTray()
+    {
+        _miniPlayer?.Hide();
+        Show();
+        if (WindowState == WindowState.Minimized)
+        {
+            WindowState = WindowState.Normal;
+        }
+
+        Activate();
+    }
+
+    private void HideToTray()
+    {
+        Hide();
+        if (!_settings.TrayHintShown)
+        {
+            _settings.TrayHintShown = true;
+            SaveSettings();
+            _tray?.ShowBalloon("트레이에서 계속 재생 중", "아이콘을 클릭하면 미니 플레이어, 더블클릭하면 창이 열립니다. 오른쪽 클릭으로 종료할 수 있습니다.");
+        }
+    }
+
+    private void ExitApp()
+    {
+        _exiting = true;
+        Close();
+    }
+
+    private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (_exiting)
+        {
+            return;
+        }
+
+        var action = _settings.CloseAction;
+        if (action == CloseAction.Ask)
+        {
+            var dialog = new CloseChoiceWindow { Owner = this };
+            dialog.ShowDialog();
+            if (dialog.Choice is not { } choice)
+            {
+                e.Cancel = true; // Esc: keep the window open.
+                return;
+            }
+
+            action = choice;
+            if (dialog.Remember)
+            {
+                _settings.CloseAction = choice;
+                SaveSettings();
+            }
+        }
+
+        if (action == CloseAction.Tray)
+        {
+            e.Cancel = true;
+            HideToTray();
+            return;
+        }
+
+        _exiting = true;
+    }
+
     private void MainWindow_Closed(object? sender, EventArgs e)
     {
         _meterTimer.Stop();
+        _ytmTimer.Stop();
+        _miniPlayer?.Close();
+        _tray?.Dispose();
         SaveSettings();
-        _audioSessions.Dispose();
+        _meter?.Dispose();
+        _player.Dispose();
     }
 }
