@@ -21,6 +21,17 @@ public sealed class AppSettings
     /// <summary>The "still playing in the tray" balloon is shown only once.</summary>
     public bool TrayHintShown { get; set; }
 
+    /// <summary>YouTube Music's own volume (0-100) and mute, restored when the player loads.</summary>
+    public int? YouTubeMusicVolume { get; set; }
+    public bool YouTubeMusicMuted { get; set; }
+
+    /// <summary>App (Windows session) volume and mute, restored when the player's sound starts.</summary>
+    public int? AppVolumePercent { get; set; }
+    public bool AppMuted { get; set; }
+
+    /// <summary>Main window size and position (normal bounds) and whether it was maximized.</summary>
+    public WindowPlacement? Window { get; set; }
+
     /// <summary>0 for files written before this property existed (version 1 scale).</summary>
     public int LevelScaleVersion { get; set; } = CurrentLevelScaleVersion;
 
@@ -42,6 +53,22 @@ public sealed class AppSettings
         {
             MaximumVolumePercent = Math.Min(100, MinimumVolumePercent + 5);
         }
+
+        if (YouTubeMusicVolume is { } ytm)
+        {
+            YouTubeMusicVolume = Math.Clamp(ytm, 0, 100);
+        }
+
+        if (AppVolumePercent is { } app)
+        {
+            AppVolumePercent = Math.Clamp(app, 0, 100);
+        }
+
+        if (Window is { } w && (w.Width < 200 || w.Height < 200
+            || !double.IsFinite(w.Left) || !double.IsFinite(w.Top)))
+        {
+            Window = null;
+        }
     }
 }
 
@@ -50,4 +77,13 @@ public enum CloseAction
     Ask,
     Tray,
     Exit
+}
+
+public sealed class WindowPlacement
+{
+    public double Left { get; set; }
+    public double Top { get; set; }
+    public double Width { get; set; }
+    public double Height { get; set; }
+    public bool Maximized { get; set; }
 }
