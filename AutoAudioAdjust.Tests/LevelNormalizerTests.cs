@@ -241,4 +241,44 @@ public sealed class LevelNormalizerTests
             Assert.Equal(scale, Loudness.ToScale(Loudness.ToDb(scale)), 6);
         }
     }
+    [Fact]
+    public void SavedVolumesAndWindowSurviveJsonRoundTrip()
+    {
+        var settings = new AppSettings
+        {
+            YouTubeMusicVolume = 47,
+            YouTubeMusicMuted = true,
+            AppVolumePercent = 13,
+            AppMuted = false,
+            Window = new WindowPlacement { Left = 100, Top = 80, Width = 1280, Height = 800, Maximized = true }
+        };
+
+        var json = System.Text.Json.JsonSerializer.Serialize(settings);
+        var loaded = System.Text.Json.JsonSerializer.Deserialize<AppSettings>(json)!;
+        loaded.Validate();
+
+        Assert.Equal(47, loaded.YouTubeMusicVolume);
+        Assert.True(loaded.YouTubeMusicMuted);
+        Assert.Equal(13, loaded.AppVolumePercent);
+        Assert.NotNull(loaded.Window);
+        Assert.Equal(1280, loaded.Window!.Width);
+        Assert.True(loaded.Window.Maximized);
+    }
+
+    [Fact]
+    public void InvalidSavedVolumesAndWindowAreCorrected()
+    {
+        var settings = new AppSettings
+        {
+            YouTubeMusicVolume = 140,
+            AppVolumePercent = -5,
+            Window = new WindowPlacement { Left = double.NaN, Top = 0, Width = 1280, Height = 800 }
+        };
+
+        settings.Validate();
+
+        Assert.Equal(100, settings.YouTubeMusicVolume);
+        Assert.Equal(0, settings.AppVolumePercent);
+        Assert.Null(settings.Window);
+    }
 }

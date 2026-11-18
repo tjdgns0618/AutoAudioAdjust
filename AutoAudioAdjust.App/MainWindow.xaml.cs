@@ -48,9 +48,26 @@ public partial class MainWindow : Window
     private double _lastDisplayDb = LevelNormalizer.FloorDb;
     private float? _lastVolume;
 
+    // Restoring saved volumes happens once, when the player / its sound first appears.
+    private bool _ytmVolumeRestored;
+    private bool _appVolumeRestored;
+    private readonly DispatcherTimer _saveTimer;
+
     public MainWindow()
     {
         InitializeComponent();
+
+        // Loaded before the window is shown so its saved size and position apply immediately.
+        _settings = _settingsStore.Load();
+        ApplyWindowPlacement();
+
+        // Volume changes happen often (sliders, auto adjust); save them at most once a second.
+        _saveTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _saveTimer.Tick += (_, _) =>
+        {
+            _saveTimer.Stop();
+            SaveSettings();
+        };
 
         _meterTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
@@ -87,9 +104,65 @@ public partial class MainWindow : Window
 
     private bool IsAutoAdjustOn => AutoToggle.IsChecked == true;
 
+    private void ApplyWindowPlacement()
+    {
+        if (_settings.Window is not { } placement)
+        {
+            return;
+        }
+
+        // Only restore when the saved area is still on a connected screen.
+        var screen = new Rect(SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,
+            SystemParameters.VirtualScreenWidth, SystemParameters.VirtualScreenHeight);
+        var saved = new Rect(placement.Left, placement.Top, placement.Width, placement.Height);
+        var visible = Rect.Intersect(screen, saved);
+        if (visible.IsEmpty || visible.Width < 200 || visible.Height < 100)
+        {
+            return;
+        }
+
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        Left = placement.Left;
+        Top = placement.Top;
+        Width = Math.Max(MinWidth, placement.Width);
+        Height = Math.Max(MinHeight, placement.Height);
+        if (placement.Maximized)
+        {
+            WindowState = WindowState.Maximized;
+        }
+    }
+
+    private void CaptureWindowPlacement()
+    {
+        if (WindowState == WindowState.Minimized && RestoreBounds.IsEmpty)
+        {
+            return;
+        }
+
+        var bounds = WindowState == WindowState.Normal ? new Rect(Left, Top, ActualWidth, ActualHeight) : RestoreBounds;
+        if (bounds.IsEmpty || bounds.Width < 200)
+        {
+            return;
+        }
+
+        _settings.Window = new WindowPlacement
+        {
+            Left = bounds.Left,
+            Top = bounds.Top,
+            Width = bounds.Width,
+            Height = bounds.Height,
+            Maximized = WindowState == WindowState.Maximized
+        };
+    }
+
+    private void RequestSave()
+    {
+        _saveTimer.Stop();
+        _saveTimer.Start();
+    }
+
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
-        _settings = _settingsStore.Load();
         TargetSlider.Value = Math.Round(Loudness.ToScale(_settings.TargetLevelDb));
         MinVolumeSlider.Value = _settings.MinimumVolumePercent;
         MaxVolumeSlider.Value = _settings.MaximumVolumePercent;
@@ -229,6 +302,19 @@ public partial class MainWindow : Window
 
         try
         {
+            if (!_appVolumeRestored)
+            {
+                // First sound since launch: start from the last app volume instead of 100%, so the
+                // first song is not suddenly loud and manual settings carry over.
+                _appVolumeRestored = true;
+                if (_settings.AppVolumePercent is { } savedVolume)
+                {
+                    _player.Volume = savedVolume / 100f;
+                }
+                _player.Muted = _settings.AppMuted;
+                _normalizer.Reset();
+            }
+
             var volume = _player.Volume;
             if (IsAutoAdjustOn)
             {
@@ -238,6 +324,8 @@ public partial class MainWindow : Window
                     _player.Volume = newVolume;
                     volume = newVolume;
                 }
+
+                RememberAppVolume(volume);
 
                 // Show what is actually heard (YouTube Music volume included).
                 var heardDb = LevelNormalizer.IsSilent(result.DisplayLevelDb)
@@ -256,6 +344,16 @@ public partial class MainWindow : Window
         {
             // The player's audio session went away (device change, renderer restart).
             _player.Invalidate();
+        }
+    }
+
+    private void RememberAppVolume(float volume)
+    {
+        var percent = (int)Math.Round(volume * 100);
+        if (_settings.AppVolumePercent != percent)
+        {
+            _settings.AppVolumePercent = percent;
+            RequestSave();
         }
     }
 
@@ -316,6 +414,33 @@ public partial class MainWindow : Window
         }
 
         var np = _nowPlaying;
+        if (np.Volume is { } current && !_ytmVolumeRestored)
+        {
+            // The player just loaded: put back the YouTube Music volume and mute from last time.
+            _ytmVolumeRestored = true;
+            if (_settings.YouTubeMusicVolume is { } savedVolume && Math.Abs(savedVolume - current) >= 1)
+            {
+                await _bridge.SetVolumeAsync(savedVolume);
+            }
+            if (_settings.YouTubeMusicVolume is not null && _settings.YouTubeMusicMuted != np.Muted)
+            {
+                await _bridge.SetMutedAsync(_settings.YouTubeMusicMuted);
+            }
+            return; // the next poll shows the restored values
+        }
+
+        if (np.Volume is { } changed && _ytmVolumeRestored)
+        {
+            // Remember changes made here or with YouTube Music's own volume control.
+            var percent = (int)Math.Round(changed);
+            if (_settings.YouTubeMusicVolume != percent || _settings.YouTubeMusicMuted != np.Muted)
+            {
+                _settings.YouTubeMusicVolume = percent;
+                _settings.YouTubeMusicMuted = np.Muted;
+                RequestSave();
+            }
+        }
+
         YtmVolumeSlider.IsEnabled = np.Volume is not null;
         YtmMuteButton.IsEnabled = np.Volume is not null;
         if (np.Volume is { } volume)
@@ -411,6 +536,7 @@ public partial class MainWindow : Window
 
         _player.Volume = (float)(e.NewValue / 100.0);
         CurrentVolumeText.Text = $"{e.NewValue:0}%";
+        RememberAppVolume(_player.Volume);
     }
 
     private void AppMuteButton_Click(object sender, RoutedEventArgs e)
@@ -418,6 +544,8 @@ public partial class MainWindow : Window
         var muted = !_player.Muted;
         _player.Muted = muted;
         AppMuteButton.Content = muted ? MutedIcon : VolumeIcon;
+        _settings.AppMuted = muted;
+        RequestSave();
     }
 
     private void SetAppVolumeControlsAvailable(bool hasSession)
@@ -594,7 +722,9 @@ public partial class MainWindow : Window
 
     private void HideToTray()
     {
+        CaptureWindowPlacement();
         Hide();
+        SaveSettings();
         if (!_settings.TrayHintShown)
         {
             _settings.TrayHintShown = true;
@@ -611,6 +741,7 @@ public partial class MainWindow : Window
 
     private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
+        CaptureWindowPlacement();
         if (_exiting)
         {
             return;
@@ -649,6 +780,7 @@ public partial class MainWindow : Window
     {
         _meterTimer.Stop();
         _ytmTimer.Stop();
+        _saveTimer.Stop();
         _miniPlayer?.Close();
         _tray?.Dispose();
         SaveSettings();
