@@ -681,6 +681,10 @@ public partial class MainWindow : Window
         _miniPlayer.NextRequested += () => _ = _bridge?.NextAsync();
         _miniPlayer.PreviousRequested += () => _ = _bridge?.PreviousAsync();
         _miniPlayer.AutoAdjustChanged += on => AutoToggle.IsChecked = on;
+        _miniPlayer.SeekRequested += seconds => _ = _bridge?.SeekAsync(seconds);
+        // Route through the main window's YouTube Music controls so gain, saving and UI stay in sync.
+        _miniPlayer.VolumeChanged += volume => YtmVolumeSlider.Value = volume;
+        _miniPlayer.MuteToggled += () => YtmMuteButton_Click(YtmMuteButton, new RoutedEventArgs());
     }
 
     private void ToggleMiniPlayer()
