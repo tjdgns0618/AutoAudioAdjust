@@ -254,18 +254,18 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// Captures the process that owns the player's audio session. WebView2 may restart its audio
-    /// process, so capture follows the session's process.
+    /// process, so capture follows the session's process. When no session is found for a moment
+    /// (a failed scan, a device change), the current capture is kept instead of being restarted.
     /// </summary>
     private void EnsureMeter()
     {
-        var pid = _player.SessionProcessId;
-        if (pid == _meterProcessId)
+        if (_player.SessionProcessId is not { } pid || pid == _meterProcessId)
         {
             return;
         }
 
         _meter?.Dispose();
-        _meter = pid is { } id ? ProcessLoopbackMeter.Start(id) : null;
+        _meter = ProcessLoopbackMeter.Start(pid);
         _meterProcessId = pid;
         _normalizer.Reset();
         _recentSquaredLevels.Clear();
