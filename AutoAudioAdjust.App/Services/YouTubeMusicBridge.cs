@@ -12,7 +12,9 @@ public sealed record NowPlaying(
     string Artist,
     string? ArtworkUrl,
     double? Volume,
-    bool Muted)
+    bool Muted,
+    double? Position = null,
+    double? Duration = null)
 {
     public static readonly NowPlaying Empty = new(false, false, "", "", null, null, false);
 
@@ -33,7 +35,12 @@ public sealed class YouTubeMusicBridge(CoreWebView2 core)
           const m = navigator.mediaSession && navigator.mediaSession.metadata;
           const art = m && m.artwork && m.artwork.length ? m.artwork[m.artwork.length - 1].src : null;
           const hasPlayer = !!(p && p.getVolume);
+          const finite = x => (typeof x === 'number' && isFinite(x)) ? x : null;
+          const pos = finite(p && p.getCurrentTime ? p.getCurrentTime() : (v ? v.currentTime : null));
+          const dur = finite(p && p.getDuration ? p.getDuration() : (v ? v.duration : null));
           return {
+            position: pos,
+            duration: dur && dur > 0 ? dur : null,
             hasPlayer,
             playing: !!(v && !v.paused && !v.ended),
             title: m ? m.title : '',
@@ -95,7 +102,9 @@ public sealed class YouTubeMusicBridge(CoreWebView2 core)
                 root.GetProperty("artist").GetString() ?? "",
                 root.GetProperty("art").ValueKind == JsonValueKind.String ? root.GetProperty("art").GetString() : null,
                 root.GetProperty("volume").ValueKind == JsonValueKind.Number ? root.GetProperty("volume").GetDouble() : null,
-                root.GetProperty("muted").GetBoolean());
+                root.GetProperty("muted").GetBoolean(),
+                GetNumber(root, "position"),
+                GetNumber(root, "duration"));
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException or COMException)
         {
@@ -104,7 +113,23 @@ public sealed class YouTubeMusicBridge(CoreWebView2 core)
         }
     }
 
+    private static double? GetNumber(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number ? value.GetDouble() : null;
+
     public Task PlayPauseAsync() => RunAsync(PlayPauseScript);
+
+    /// <summary>Jumps to <paramref name="seconds"/> in the current song.</summary>
+    public Task SeekAsync(double seconds) => RunAsync($$"""
+        (() => {
+          const t = {{Math.Max(0, seconds).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}};
+          const p = document.getElementById('movie_player');
+          if (p && p.seekTo) { p.seekTo(t, true); return true; }
+          const v = document.querySelector('video');
+          if (!v) return false;
+          v.currentTime = t;
+          return true;
+        })()
+        """);
 
     public Task NextAsync() => RunAsync(NextScript);
 
