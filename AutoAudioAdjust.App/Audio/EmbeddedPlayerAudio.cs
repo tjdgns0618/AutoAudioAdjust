@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
 
 namespace AutoAudioAdjust.App.Audio;
 
@@ -8,6 +9,11 @@ namespace AutoAudioAdjust.App.Audio;
 /// child processes (msedgewebview2.exe), so this finds the Windows audio sessions that belong to
 /// any descendant of this process and controls their volume together. Because these sessions
 /// only ever contain this app's player, nothing else on the PC is measured or changed.
+/// <para>
+/// This app's own process is skipped on purpose: the level meter's loopback capture shows up as an
+/// audio session of this process on the same device. Picking that session as the "player" made the
+/// meter capture this app itself (silence), so auto adjust stopped following the music.
+/// </para>
 /// </summary>
 public sealed class EmbeddedPlayerAudio : IDisposable
 {
@@ -15,8 +21,9 @@ public sealed class EmbeddedPlayerAudio : IDisposable
 
     private readonly int _rootProcessId = Environment.ProcessId;
     private readonly List<AudioSessionControl> _sessions = [];
+    private readonly List<MMDevice> _devices = [];
     private MMDeviceEnumerator? _enumerator;
-    private MMDevice? _device;
+    private int? _primaryProcessId;
     private DateTime _lastScan = DateTime.MinValue;
     private float _volume = 1f;
     private bool _volumeWasSet;
@@ -102,15 +109,25 @@ public sealed class EmbeddedPlayerAudio : IDisposable
         try
         {
             _enumerator = new MMDeviceEnumerator();
-            _device = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
             var descendants = ProcessTree.GetDescendants(_rootProcessId);
-            var collection = _device.AudioSessionManager.Sessions;
-            for (var i = 0; i < collection.Count; i++)
+
+            // Every active output device, not only the default one: the player may be routed to
+            // another device in Windows' per-app sound settings, or keep playing on the old device
+            // for a moment after the default changes.
+            foreach (var device in _enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
             {
-                var control = collection[i];
-                var pid = (int)control.GetProcessID;
-                if (pid == _rootProcessId || descendants.Contains(pid))
+                _devices.Add(device);
+                var collection = device.AudioSessionManager.Sessions;
+                for (var i = 0; i < collection.Count; i++)
                 {
+                    var control = collection[i];
+                    var pid = (int)control.GetProcessID;
+                    if (!descendants.Contains(pid) || control.State == AudioSessionState.AudioSessionStateExpired)
+                    {
+                        control.Dispose();
+                        continue;
+                    }
+
                     _sessions.Add(control);
                     // A new session (new device or restarted renderer) starts at 100%; keep it in step.
                     if (_volumeWasSet && Math.Abs(control.SimpleAudioVolume.Volume - _volume) > 0.001f)
@@ -118,12 +135,9 @@ public sealed class EmbeddedPlayerAudio : IDisposable
                         control.SimpleAudioVolume.Volume = _volume;
                     }
                 }
-                else
-                {
-                    control.Dispose();
-                }
             }
 
+            PutPrimaryFirst();
             if (_sessions.Count > 0 && !_volumeWasSet)
             {
                 _volume = _sessions[0].SimpleAudioVolume.Volume;
@@ -136,6 +150,42 @@ public sealed class EmbeddedPlayerAudio : IDisposable
         }
     }
 
+    /// <summary>
+    /// Moves the session the meter should follow to index 0. Keeps the current one while it is
+    /// still there, so the meter is not restarted just because Windows listed sessions in another
+    /// order; otherwise prefers a session that is playing right now.
+    /// </summary>
+    private void PutPrimaryFirst()
+    {
+        if (_sessions.Count == 0)
+        {
+            return; // keep _primaryProcessId: a short gap between scans should not lose it
+        }
+
+        var index = _primaryProcessId is { } current
+            ? _sessions.FindIndex(s => (int)s.GetProcessID == current && s.State == AudioSessionState.AudioSessionStateActive)
+            : -1;
+        if (index < 0)
+        {
+            index = _sessions.FindIndex(s => s.State == AudioSessionState.AudioSessionStateActive);
+        }
+        if (index < 0 && _primaryProcessId is { } previous)
+        {
+            index = _sessions.FindIndex(s => (int)s.GetProcessID == previous);
+        }
+        if (index < 0)
+        {
+            index = 0;
+        }
+
+        if (index > 0)
+        {
+            (_sessions[0], _sessions[index]) = (_sessions[index], _sessions[0]);
+        }
+
+        _primaryProcessId = (int)_sessions[0].GetProcessID;
+    }
+
     private void DisposeSessions()
     {
         foreach (var session in _sessions)
@@ -144,8 +194,12 @@ public sealed class EmbeddedPlayerAudio : IDisposable
         }
 
         _sessions.Clear();
-        _device?.Dispose();
-        _device = null;
+        foreach (var device in _devices)
+        {
+            device.Dispose();
+        }
+
+        _devices.Clear();
         _enumerator?.Dispose();
         _enumerator = null;
     }
