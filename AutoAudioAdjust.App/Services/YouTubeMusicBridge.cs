@@ -36,8 +36,14 @@ public sealed class YouTubeMusicBridge(CoreWebView2 core)
           const art = m && m.artwork && m.artwork.length ? m.artwork[m.artwork.length - 1].src : null;
           const hasPlayer = !!(p && p.getVolume);
           const finite = x => (typeof x === 'number' && isFinite(x)) ? x : null;
-          const pos = finite(p && p.getCurrentTime ? p.getCurrentTime() : (v ? v.currentTime : null));
-          const dur = finite(p && p.getDuration ? p.getDuration() : (v ? v.duration : null));
+          // Prefer the player bar's own progress bar: it is exactly what YouTube Music shows
+          // (the player API has been seen reporting another length than the bar).
+          const bar = document.querySelector('ytmusic-player-bar #progress-bar');
+          const barMax = bar ? finite(Number(bar.max)) : null;
+          const barValue = bar ? finite(Number(bar.value)) : null;
+          const useBar = barMax !== null && barMax > 0 && barValue !== null;
+          const pos = useBar ? barValue : finite(p && p.getCurrentTime ? p.getCurrentTime() : (v ? v.currentTime : null));
+          const dur = useBar ? barMax : finite(p && p.getDuration ? p.getDuration() : (v ? v.duration : null));
           return {
             position: pos,
             duration: dur && dur > 0 ? dur : null,
@@ -118,11 +124,20 @@ public sealed class YouTubeMusicBridge(CoreWebView2 core)
 
     public Task PlayPauseAsync() => RunAsync(PlayPauseScript);
 
-    /// <summary>Jumps to <paramref name="seconds"/> in the current song.</summary>
+    /// <summary>
+    /// Jumps to <paramref name="seconds"/> on the player bar's timeline (the one the position and
+    /// length come from). If the player API reports another length, the target is scaled to it.
+    /// </summary>
     public Task SeekAsync(double seconds) => RunAsync($$"""
         (() => {
-          const t = {{Math.Max(0, seconds).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}};
+          let t = {{Math.Max(0, seconds).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}};
           const p = document.getElementById('movie_player');
+          const bar = document.querySelector('ytmusic-player-bar #progress-bar');
+          const barMax = bar ? Number(bar.max) : NaN;
+          const apiMax = p && p.getDuration ? p.getDuration() : NaN;
+          if (isFinite(barMax) && barMax > 0 && isFinite(apiMax) && apiMax > 0 && Math.abs(barMax - apiMax) > 2) {
+            t = t * apiMax / barMax;
+          }
           if (p && p.seekTo) { p.seekTo(t, true); return true; }
           const v = document.querySelector('video');
           if (!v) return false;
